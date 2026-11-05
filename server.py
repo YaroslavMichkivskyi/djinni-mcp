@@ -28,7 +28,7 @@ from mcpkit import (DRY_RUN_PROP, PAGING_PROPS, McpServer, SiteSession, Stop, at
                     csrf_token, html_to_text, is_action_link, load_env, log, override_form, page_links, page_main,
                     page_title, parse_form, slice_text)
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 BASE = "https://djinni.co"
 HOSTS = ("djinni.co",)
 # Plain GET links that change the account: /my/kill9/ deletes it, /my/stop/ switches the search off,
@@ -185,7 +185,7 @@ def get_profile() -> dict:
     m = re.search(r"Востаннє.*?дн\.|Last raised.*?days?", near)
     raise_info = m.group(0) if m else None
     fields = {k: v for k, v in parsed["fields"].items() if k != "csrfmiddlewaretoken"}
-    return {"url": final, "raise_info": raise_info, "fields": fields}
+    return {"url": final, "raise_info": raise_info, "skills": _skills(fields), "fields": fields}
 
 
 def _threads(page: str) -> list[dict]:
@@ -416,18 +416,72 @@ def _profile_salary(form: str) -> int | None:
 
 # ------------------------------------------------------------ write tools ---
 
+SKILL_YEARS = ("", "0.5", "1", "1.5", "2", "2.5", "3", "3.5", "4", "4.5", "5", "6", "7", "8", "9", "10")
+
+
+def _skills(fields: dict) -> list[dict]:
+    """The skill chips in form order: [{"index", "skill", "years"}]."""
+    out = []
+    for name, f in fields.items():
+        m = re.fullmatch(r"skills_experience\[(\d+)\]\[skill\]", name)
+        if m and f.get("value"):
+            years = fields.get(f"skills_experience[{m.group(1)}][experience_years]", {}).get("value")
+            out.append({"index": int(m.group(1)), "skill": f["value"], "years": years or None})
+    return sorted(out, key=lambda s: s["index"])
+
+
 @server.tool("update_profile", "Change fields of my Djinni profile (names from get_profile; lists for multi-choice "
-             "fields, true/false for single checkboxes). Every other field keeps its current value.",
+             "fields, true/false for single checkboxes) and/or add skill chips. Every other field keeps its "
+             "current value. A skill already in the profile is not added twice (its years are updated instead).",
              {"changes": {"type": "object", "description": 'e.g. {"position": "Full Stack Engineer", "salary_min": "2500"}'},
-              **DRY_RUN}, ["changes"], title="Edit my profile", read_only=False, destructive=True, idempotent=True)
-def update_profile(changes: dict, dry_run: bool = False) -> dict:
-    if not changes:
+              "add_skills": {"type": "array", "description": "skills to add, each a separate technology / tool as "
+                                                             "Djinni lists it (no job titles, no combos)",
+                             "items": {"type": "object", "additionalProperties": False, "required": ["skill"],
+                                       "properties": {"skill": {"type": "string"},
+                                                      "years": {"type": "string", "enum": list(SKILL_YEARS)}}}},
+              "remove_skills": {"type": "array", "items": {"type": "string"},
+                                "description": "skill names to remove (as get_profile lists them)"},
+              **DRY_RUN}, [], title="Edit my profile", read_only=False, destructive=True, idempotent=True)
+def update_profile(changes: dict | None = None, add_skills: list[dict] | None = None,
+                   remove_skills: list[str] | None = None, dry_run: bool = False) -> dict:
+    changes = dict(changes or {})
+    if not changes and not add_skills and not remove_skills:
         raise Stop("nothing to change")
     final, parsed, page = _profile_form()
-    pairs = override_form(parsed["pairs"], parsed["fields"], changes)
+    current = _skills(parsed["fields"])
+    removed = []
+    for name in remove_skills or []:
+        hit = next((s for s in current if s["skill"].casefold() == name.strip().casefold()), None)
+        if not hit:
+            raise Stop(f"'{name}' is not in the profile; skills: {[s['skill'] for s in current]}")
+        removed.append(hit)
+    drop = {f"skills_experience[{s['index']}][{part}]" for s in removed for part in ("skill", "experience_years")}
+    parsed["pairs"] = [(n, v) for n, v in parsed["pairs"] if n not in drop]
+    current = [s for s in current if s not in removed]
+    added, extra_pairs = [], []
+    next_index = max([s["index"] for s in current] + [-1]) + 1
+    for item in add_skills or []:
+        skill, years = (item.get("skill") or "").strip(), str(item.get("years") or "")
+        if not skill or years not in SKILL_YEARS:
+            raise Stop(f"bad skill entry {item}: a name and years from {SKILL_YEARS}")
+        if re.search(r"[,;]|\s/\s| and | або ", skill):  # "Redux / Zustand" is two skills, "CI/CD" is one
+            raise Stop(f"'{skill}' looks like several skills — Djinni wants one technology per chip")
+        same = next((s for s in current if s["skill"].casefold() == skill.casefold()), None)
+        if same:
+            if years:
+                changes[f"skills_experience[{same['index']}][experience_years]"] = years
+            continue
+        if any(a["skill"].casefold() == skill.casefold() for a in added):
+            continue
+        extra_pairs += [(f"skills_experience[{next_index}][skill]", skill),
+                        (f"skills_experience[{next_index}][experience_years]", years)]
+        added.append({"skill": skill, "years": years or None})
+        next_index += 1
+    pairs = override_form(parsed["pairs"], parsed["fields"], changes) + extra_pairs
     before = {k: parsed["fields"][k].get("value") for k in changes}
     if dry_run:
-        return {"dry_run": True, "url": final, "before": before, "after": changes}
+        return {"dry_run": True, "url": final, "before": before, "after": changes, "skills_now": current,
+                "skills_to_add": added, "skills_to_remove": [s["skill"] for s in removed]}
     if not any(n == "csrfmiddlewaretoken" for n, _ in pairs):
         pairs.append(("csrfmiddlewaretoken", _csrf(page)))
     _, status, body = session.request(f"{BASE}/my/profile/", data=pairs,
@@ -436,9 +490,22 @@ def update_profile(changes: dict, dry_run: bool = False) -> dict:
         raise Stop(f"HTTP {status} saving the profile")
     errors = [clean(e) for e in re.findall(r'class="[^"]*(?:invalid-feedback d-block|errorlist)[^"]*"[^>]*>(.*?)</',
                                            body, re.S) if clean(e)]
+    # Djinni marks a rejected field's row with is-invalid and re-renders the form
+    errors += [f"field rejected: {attr(t, 'id') or attr(t, 'name') or t[:80]}"
+               for t in re.findall(r'<[^>]*class="[^"]*\bis-invalid\b[^"]*"[^>]*>', body)]
     _, after, _ = _profile_form()
     now = {k: after["fields"].get(k, {}).get("value") for k in changes}
-    return {"saved": not errors, "errors": errors or None, "before": before, "now": now}
+    skills_after = _skills(after["fields"])
+    kept = {s["skill"].casefold() for s in skills_after}
+    missing = [a["skill"] for a in added if a["skill"].casefold() not in kept]
+    still_there = [s["skill"] for s in removed if s["skill"].casefold() in kept]
+    return {"saved": not errors and not still_there, "errors": errors or None, "before": before, "now": now,
+            "skills_removed": [s["skill"] for s in removed if s["skill"].casefold() not in kept] or None,
+            "skills_not_removed": still_there or None,
+            "note": "Djinni renames new skills to its own dictionary entries — see skills_not_kept vs the profile"
+            if missing else None,
+            "skills_added": [a for a in added if a["skill"].casefold() in kept] or None,
+            "skills_not_kept": missing or None, "skills_total": len(skills_after)}
 
 
 def _message_ids(page: str) -> list[str]:

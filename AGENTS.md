@@ -39,7 +39,7 @@ Write — `readOnlyHint: false`, each with `dry_run` (returns the exact payload,
 
 | Tool | Does | Hints |
 |---|---|---|
-| `update_profile` | change profile fields by name; others keep their values; validates options | destructive, idempotent |
+| `update_profile` | change profile fields by name (others keep their values; options validated); `add_skills` / `remove_skills` for skill chips — Djinni renames new skills to its own dictionary entries, so check `get_profile` after | destructive, idempotent |
 | `send_message` | reply in a thread; verifies the new message appeared | not idempotent |
 | `apply_to_job` | apply with a message, chosen CV, optional salary for this vacancy; refuses a repeat | not idempotent |
 | `decline_offer` | decline + archive a recruiter's offer | destructive, idempotent |
