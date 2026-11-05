@@ -24,17 +24,18 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from mcpkit import (McpServer, SiteSession, Stop, clean, html_to_text, load_env, log,  # noqa: E402
-                    override_form, page_links, page_main, page_title, parse_form)
+from mcpkit import (DRY_RUN_PROP, PAGING_PROPS, McpServer, SiteSession, Stop, attr, clean,  # noqa: E402
+                    csrf_token, html_to_text, is_action_link, load_env, log, override_form, page_links, page_main,
+                    page_title, parse_form, slice_text)
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 BASE = "https://djinni.co"
 HOSTS = ("djinni.co",)
 # Plain GET links that change the account: /my/kill9/ deletes it, /my/stop/ switches the search off,
 # ?action=decline archives a thread.
-UNSAFE_PATH = re.compile(r"logout|kill|/stop/|delete|remove|deactivat|unsubscrib|raise|reactivat|apply|reject|"
-                         r"accept|withdraw|toggle|/send|/htmx/|/ajax/|/\d+/(?:un)?(?:archive|hide|block|ban|read)\b", re.I)
-UNSAFE_QUERY = re.compile(r"(?:^|&)(?:action|do|op|cmd|method)=", re.I)
+ACTION_SEGMENTS = re.compile(r"logout.*|kill\d*|stop|delete.*|remove.*|deactivat.*|unsubscrib.*|raise|reactivat.*|"
+                             r"apply|reject|accept|withdraw|toggle.*|send|htmx|ajax|(?:un)?archive|hide|block|ban|"
+                             r"(?:mark_)?(?:un)?read", re.I)
 ENGLISH = ("no_english", "basic", "pre", "intermediate", "upper", "fluent", "proficient", "native")
 REGIONS = ("UKR", "eu", "worldwide", "other")
 BUCKETS = ("all", "unread", "apply", "archive")
@@ -46,12 +47,7 @@ server = McpServer("djinni", VERSION, instructions=(
     "then call once. Never send, apply or decline on your own initiative."))
 session: SiteSession  # set in main()
 
-DRY_RUN = {"dry_run": {"type": "boolean", "default": False,
-                       "description": "true: validate and return exactly what would be sent, send nothing"}}
-PAGING = {
-    "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "start of the text slice"},
-    "max_chars": {"type": "integer", "minimum": 500, "maximum": 60000, "default": 15000},
-}
+DRY_RUN, PAGING = DRY_RUN_PROP, PAGING_PROPS
 NAV_NOISE = re.compile(r"^.*?(?:Акаунт рекрутера|Recruiter account)\s*-?\s*(?:Вийти|Log out)\s*", re.S)
 
 
@@ -61,24 +57,12 @@ def _is_login(final: str, page: str) -> bool:
     return "/login" in urllib.parse.urlsplit(final).path or ('name="password"' in page and 'id="signup"' in page)
 
 
-def _csrf(page: str) -> str:
-    m = re.search(r"name=['\"]csrfmiddlewaretoken['\"] value=['\"]([^'\"]+)", page) or \
-        re.search(r'data-csrf-token="([^"]+)"', page)
-    if not m:
-        raise Stop("no CSRF token on the page — markup changed or not logged in")
-    return m.group(1)
+_csrf, _slice = csrf_token, slice_text
 
 
 def _text(page: str) -> str:
     text = NAV_NOISE.sub("", html_to_text(page_main(page)), count=1)
     return re.sub(r"^\s*Помилка\s*", "", text)
-
-
-def _slice(text: str, offset: int, max_chars: int) -> dict:
-    out = {"chars": len(text), "text": text[offset:offset + max_chars]}
-    if offset + max_chars < len(text):
-        out["next_offset"] = offset + max_chars
-    return out
 
 
 def _thread_id(value: str) -> str:
@@ -142,7 +126,7 @@ def _get(path_or_url: str) -> tuple[str, str]:
     """GET a djinni.co page in my session; logs in once if the session is gone."""
     url = urllib.parse.urljoin(BASE, path_or_url)
     parts = urllib.parse.urlsplit(url)
-    if UNSAFE_PATH.search(parts.path) or UNSAFE_QUERY.search(parts.query):
+    if is_action_link(url, ACTION_SEGMENTS):
         raise Stop(f"{url} looks like an action link (changes the account) — not opened")
     final, status, page = session.request(url)
     if _is_login(final, page) and "/login" not in parts.path:
@@ -408,14 +392,26 @@ def get_job(url: str) -> dict:
     jobs = _postings(page)
     out = jobs[0] if jobs else {"text": _text(page)[:20000]}
     form = _apply_form(page)
-    cvs = re.findall(r'<option value="(\d+)"[^>]*data-cv-name="([^"]*)"[^>]*data-cv-date="([^"]*)"', form or "")
-    salary = re.search(r'name="salary_changed"[^>]*data-value="(\d+)"', form or "")
     thread = re.search(r'href="/my/inbox/(\d+)/', page)
     out.update({"url": final, "can_apply": bool(form),
                 "thread": thread.group(1) if thread and not form else None,
-                "cvs": [{"id": i, "file": n, "date": d} for i, n, d in cvs] or None,
-                "profile_salary": int(salary.group(1)) if salary else None})
+                "cvs": _cvs(form) if form else None, "profile_salary": _profile_salary(form) if form else None})
     return out
+
+
+def _cvs(form: str) -> list[dict] | None:
+    """My uploaded CVs offered by the apply form (the select options with an id), the preselected one marked."""
+    field = parse_form(form)["fields"].get("cv_file_upload_id") or {}
+    dates = {attr(a, "value"): attr(a, "data-cv-date") for a in re.findall(r"<option\b([^>]*)>", form, re.I)}
+    cvs = [{"id": o["value"], "file": o["label"], "date": dates.get(o["value"]),
+            "preselected": o["value"] == field.get("value")} for o in field.get("options", []) if o["value"]]
+    return cvs or None
+
+
+def _profile_salary(form: str) -> int | None:
+    tag = re.search(r'<input\b[^>]*name="salary_changed"[^>]*>', form)
+    value = attr(tag.group(0), "data-value") if tag else None
+    return int(value) if value and value.isdigit() else None
 
 
 # ------------------------------------------------------------ write tools ---
@@ -506,11 +502,10 @@ def apply_to_job(url: str, message: str, cv_id: str | None = None, salary: int |
     cv_sent = dict(pairs).get("cv_file_upload_id")
     cv_name = next((o["label"] for o in parsed["fields"].get("cv_file_upload_id", {}).get("options", [])
                     if o["value"] == cv_sent), None)
-    profile_salary = re.search(r'name="salary_changed"[^>]*data-value="(\d+)"', form)
     job = (_postings(page) or [{}])[0]
     payload = {"vacancy": job.get("title"), "company": job.get("company"), "url": final, "message": message,
-               "cv": cv_name if cv_sent else None, "salary_for_this_vacancy": salary,
-               "profile_salary": int(profile_salary.group(1)) if profile_salary else None}
+               "cv": cv_name if cv_sent else None, "salary_for_this_vacancy": dict(pairs).get("salary_changed") or None,
+               "profile_salary": _profile_salary(form)}
     if dry_run:
         return {"dry_run": True, "would_send": payload}
     pairs.append(("job_apply", ""))
