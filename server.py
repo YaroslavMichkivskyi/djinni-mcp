@@ -1,11 +1,15 @@
-"""djinni-mcp — Djinni (djinni.co) as an MCP server: my candidate account
-(profile, inbox, conversations, any account page) and public job search.
+"""djinni-mcp — Djinni (djinni.co) as an MCP server.
 
     python server.py [--env-file PATH] [--state-dir PATH]
 
-Credentials (env or the nearest `.env`): DJINNI_EMAIL + DJINNI_PASSWORD, or
-DJINNI_COOKIES (`sessionid=…; csrftoken=…` copied from a logged-in browser).
-Read-only: no tool sends, applies, edits or raises anything.
+Account: candidate profile, inbox (offers and my applications) and threads,
+stats, jobs recommended for my profile — read, and (separate tools, each with
+`dry_run`) edit the profile, reply in a thread, apply to a vacancy, decline an
+offer. Public: job search and vacancy text.
+
+Credentials (env or the nearest `.env`): DJINNI_COOKIES (`sessionid=…;
+csrftoken=…` from a logged-in browser) or DJINNI_EMAIL + DJINNI_PASSWORD.
+Switches: DJINNI_MCP_READ_ONLY=1, DJINNI_MCP_DISABLED_TOOLS=a,b, DJINNI_MCP_DAILY=150.
 """
 
 from __future__ import annotations
@@ -20,35 +24,87 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from mcpkit import (McpServer, SiteSession, Stop, clean, html_to_text, load_env, log, page_links,  # noqa: E402
-                    page_main, page_title)
+from mcpkit import (McpServer, SiteSession, Stop, clean, html_to_text, load_env, log,  # noqa: E402
+                    override_form, page_links, page_main, page_title, parse_form)
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 BASE = "https://djinni.co"
 HOSTS = ("djinni.co",)
-# GET is not always harmless: links like these change account state.
-UNSAFE_PATH = re.compile(r"logout|delete|remove|deactivat|unsubscrib|raise|apply|reject|accept|withdraw|toggle|"
-                         r"/send|/\d+/(?:un)?(?:archive|hide|block|ban|read)\b", re.I)
+# Plain GET links that change the account: /my/kill9/ deletes it, /my/stop/ switches the search off,
+# ?action=decline archives a thread.
+UNSAFE_PATH = re.compile(r"logout|kill|/stop/|delete|remove|deactivat|unsubscrib|raise|reactivat|apply|reject|"
+                         r"accept|withdraw|toggle|/send|/htmx/|/ajax/|/\d+/(?:un)?(?:archive|hide|block|ban|read)\b", re.I)
+UNSAFE_QUERY = re.compile(r"(?:^|&)(?:action|do|op|cmd|method)=", re.I)
 ENGLISH = ("no_english", "basic", "pre", "intermediate", "upper", "fluent", "proficient", "native")
 REGIONS = ("UKR", "eu", "worldwide", "other")
+BUCKETS = ("all", "unread", "apply", "archive")
 
 server = McpServer("djinni", VERSION, instructions=(
-    "Djinni (Ukrainian IT job board) for the logged-in candidate. Every request is paced and counted against "
-    "a daily budget — call `status` first. Never send, apply or edit on your own initiative."))
+    "Djinni (Ukrainian IT job board) for the logged-in candidate. Read tools are free to call but every request "
+    "is paced and counted against a daily budget — call `status` first. Write tools (update_profile, "
+    "send_message, apply_to_job, decline_offer) act as the user: show the dry_run payload, get an explicit OK, "
+    "then call once. Never send, apply or decline on your own initiative."))
 session: SiteSession  # set in main()
 
+DRY_RUN = {"dry_run": {"type": "boolean", "default": False,
+                       "description": "true: validate and return exactly what would be sent, send nothing"}}
+PAGING = {
+    "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "start of the text slice"},
+    "max_chars": {"type": "integer", "minimum": 500, "maximum": 60000, "default": 15000},
+}
+NAV_NOISE = re.compile(r"^.*?(?:Акаунт рекрутера|Recruiter account)\s*-?\s*(?:Вийти|Log out)\s*", re.S)
 
-# ----------------------------------------------------------------- login ---
+
+# ---------------------------------------------------------------- helpers ---
+
+def _is_login(final: str, page: str) -> bool:
+    return "/login" in urllib.parse.urlsplit(final).path or ('name="password"' in page and 'id="signup"' in page)
+
+
+def _csrf(page: str) -> str:
+    m = re.search(r"name=['\"]csrfmiddlewaretoken['\"] value=['\"]([^'\"]+)", page) or \
+        re.search(r'data-csrf-token="([^"]+)"', page)
+    if not m:
+        raise Stop("no CSRF token on the page — markup changed or not logged in")
+    return m.group(1)
+
+
+def _text(page: str) -> str:
+    text = NAV_NOISE.sub("", html_to_text(page_main(page)), count=1)
+    return re.sub(r"^\s*Помилка\s*", "", text)
+
+
+def _slice(text: str, offset: int, max_chars: int) -> dict:
+    out = {"chars": len(text), "text": text[offset:offset + max_chars]}
+    if offset + max_chars < len(text):
+        out["next_offset"] = offset + max_chars
+    return out
+
+
+def _thread_id(value: str) -> str:
+    m = re.search(r"(?:^|/inbox/)(\d+)", str(value).strip())
+    if not m:
+        raise Stop("thread must be the numeric id from list_threads (or its /my/inbox/<id>/ URL)")
+    return m.group(1)
+
+
+def _job_url(url: str) -> str:
+    m = re.match(r"https://djinni\.co/jobs/(\d+)-[^/?#]+/?", (url or "").strip())
+    if not m:
+        raise Stop("give the full vacancy URL https://djinni.co/jobs/<id>-<slug>/ (a bare id gives 404 on Djinni)")
+    return m.group(0).rstrip("/") + "/"
+
+
+def _sidebar(page: str) -> str | None:
+    side = re.search(r"<sidebar\b[^>]*>(.*?)</sidebar>", page, re.S)
+    return html_to_text(side.group(1)) if side else None
+
+
+# ------------------------------------------------------------------ login ---
 
 def _logged_in() -> tuple[bool, str]:
     final, _, page = session.request(f"{BASE}/my/profile/")
-    ok = "/login" not in urllib.parse.urlsplit(final).path and 'name="password"' not in page
-    return ok, page
-
-
-def _account_name(page: str) -> str | None:
-    m = re.search(r'name="(?:full_name|name|first_name)"[^>]*value="([^"]*)"', page)
-    return clean(m.group(1)) if m and m.group(1) else None
+    return not _is_login(final, page), page
 
 
 def _login() -> dict:
@@ -61,155 +117,168 @@ def _login() -> dict:
     elif email and password:
         session.clear_cookies()
         _, _, page = session.request(f"{BASE}/login")
-        csrf = re.search(r"name=['\"]csrfmiddlewaretoken['\"] value=['\"]([^'\"]+)", page)
-        if not csrf:
-            raise Stop("Djinni login form has no CSRF token — markup changed?")
-        final, status, page = session.request(
-            f"{BASE}/login", data={"csrfmiddlewaretoken": csrf.group(1), "email": email, "password": password},
+        final, _, page = session.request(
+            f"{BASE}/login", data={"csrfmiddlewaretoken": _csrf(page), "email": email, "password": password},
             headers={"Referer": f"{BASE}/login", "Origin": BASE})
-        if "/login" in urllib.parse.urlsplit(final).path and 'name="password"' in page:
-            # the form re-renders with its empty-field hints and a generic "Помилка" title; keep the real message
+        if _is_login(final, page):
+            # the form re-renders with empty-field hints and a generic "Помилка" title; keep the real message
             msgs = [clean(m) for m in re.findall(r'class="[^"]*(?:invalid-feedback|alert|errorlist)[^"]*"[^>]*>(.*?)</div>',
                                                   page, re.S)]
             msgs = [m for m in msgs if m and m not in ("Помилка", "Error") and "заповніть" not in m
                     and "fill" not in m.lower()]
             raise Stop("Djinni login failed: " + (msgs[0] if msgs else "unknown reason") +
-                       " — if the account signs in with Google / LinkedIn / GitHub it may have no password: "
-                       "set one via 'Забули пароль?' or use DJINNI_COOKIES")
+                       " — accounts made with Google / LinkedIn / GitHub have no password until one is set "
+                       "via 'Забули пароль?'; or use DJINNI_COOKIES")
         method = "password"
     else:
-        raise Stop("no credentials: set DJINNI_COOKIES (or DJINNI_EMAIL + DJINNI_PASSWORD) in .env / the MCP config")
-    ok, page = _logged_in()
+        raise Stop("no credentials: set DJINNI_COOKIES or DJINNI_EMAIL + DJINNI_PASSWORD in .env / the MCP config")
+    ok, _ = _logged_in()
     if not ok:
         raise Stop(f"Djinni login via {method} did not give an account session (cookies expired?)")
-    return {"logged_in": True, "method": method, "name": _account_name(page)}
+    return {"logged_in": True, "method": method}
 
 
-def _account_page(path_or_url: str) -> tuple[str, str]:
-    """Fetch an account page, logging in once if the session expired."""
+def _get(path_or_url: str) -> tuple[str, str]:
+    """GET a djinni.co page in my session; logs in once if the session is gone."""
     url = urllib.parse.urljoin(BASE, path_or_url)
-    if UNSAFE_PATH.search(urllib.parse.urlsplit(url).path):
+    parts = urllib.parse.urlsplit(url)
+    if UNSAFE_PATH.search(parts.path) or UNSAFE_QUERY.search(parts.query):
         raise Stop(f"{url} looks like an action link (changes the account) — not opened")
     final, status, page = session.request(url)
-    if "/login" in urllib.parse.urlsplit(final).path and "/login" not in url:
+    if _is_login(final, page) and "/login" not in parts.path:
         log("session expired — logging in again")
         _login()
         final, status, page = session.request(url)
-        if "/login" in urllib.parse.urlsplit(final).path:
+        if _is_login(final, page):
             raise Stop("still redirected to login after logging in")
     if status >= 400:
         raise Stop(f"HTTP {status} on {url}")
     return final, page
 
 
-def _page_result(final: str, page: str, offset: int, max_chars: int, links: bool) -> dict:
-    text = html_to_text(page_main(page))
-    out = {"url": final, "title": page_title(page), "chars": len(text),
-           "text": text[offset:offset + max_chars]}
-    if offset + max_chars < len(text):
-        out["next_offset"] = offset + max_chars
-    if links:
-        out["links"] = page_links(page, final, HOSTS)
-    return out
+# -------------------------------------------------------------- account ---
 
-
-# ----------------------------------------------------------------- tools ---
-
-PAGING = {
-    "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "start of the text slice"},
-    "max_chars": {"type": "integer", "minimum": 500, "maximum": 60000, "default": 15000},
-    "links": {"type": "boolean", "default": False, "description": "also return the page's djinni.co links"},
-}
-
-
-@server.tool("status", "Is the Djinni session logged in, as whom; today's request budget. Costs 1 request.")
+@server.tool("status", "Is the Djinni session logged in; today's request budget. 1 request.", title="Session status")
 def status() -> dict:
-    ok, page = _logged_in()
-    return {"logged_in": ok, "name": _account_name(page) if ok else None,
+    ok, _ = _logged_in()
+    return {"logged_in": ok,
             "credentials": [k for k in ("DJINNI_COOKIES", "DJINNI_EMAIL", "DJINNI_PASSWORD") if os.environ.get(k)],
             "budget": session.budget(), "hidden_tools": sorted(server.hidden), "version": VERSION}
 
 
-@server.tool("login", "Log in with the configured credentials (password, else cookies). Never returns secrets.")
+@server.tool("login", "Log in again with the configured credentials (cookies, else password). Never returns secrets.",
+             title="Log in")
 def login() -> dict:
     return _login()
 
 
-@server.tool("get_page", "Read any djinni.co page in my account session as text (e.g. /my/dashboard/, "
-             "/my/stats/, /my/inbox/?page=2). Action links (logout, delete, raise, apply…) are refused.",
-             {"path": {"type": "string", "description": "path like /my/profile/ or a full https://djinni.co URL"},
-              **PAGING}, ["path"])
-def get_page(path: str, offset: int = 0, max_chars: int = 15000, links: bool = False) -> dict:
-    final, page = _account_page(path)
-    return _page_result(final, page, offset, max_chars, links)
+def _profile_form() -> tuple[str, dict, str]:
+    final, page = _get("/my/profile/")
+    form = re.search(r'<form\b[^>]*id="js-profile-form"[^>]*>(.*?)</form>', page, re.S)
+    if not form:
+        raise Stop("profile form not found on /my/profile/ — markup changed?")
+    parsed = parse_form(form.group(1))
+    labels = {i: clean(t) for i, t in re.findall(r'<label[^>]*for="([^"]+)"[^>]*>(.*?)</label>', form.group(1), re.S)}
+    id_of = {}
+    for attrs in re.findall(r"<input\b([^>]*)>", form.group(1)):
+        i, n, v = (re.search(rf'\b{a}="([^"]*)"', attrs) for a in ("id", "name", "value"))
+        if i and n:
+            id_of[(n.group(1), v.group(1) if v else "on")] = i.group(1)
+    for name, f in parsed["fields"].items():
+        if f["type"] in ("checkbox", "radio") and f.get("options"):
+            f["options"] = [{"value": v, "label": labels.get(id_of.get((name, v), ""), v)} for v in f["options"]]
+    return final, parsed, page
 
 
-@server.tool("my_profile", "My candidate profile form: title, category, experience, salary, English, "
-             "skills, search status — field by field.")
-def my_profile() -> dict:
-    final, page = _account_page("/my/profile/")
-    fields = {}
-    tags = [(t.start(), "input", t.group(1), "") for t in re.finditer(r"<input\b([^>]*)>", page, re.I)]
-    tags += [(t.start(), t.group(1).lower(), t.group(2), t.group(3))
-             for t in re.finditer(r"<(textarea|select)\b([^>]*)>(.*?)</\1>", page, re.S | re.I)]
-    for _, kind, attrs, inner in sorted(tags):
-        name = re.search(r'name="([^"]+)"', attrs)
-        if not name or name.group(1) in ("csrfmiddlewaretoken",) or "password" in name.group(1):
-            continue
-        typ = (re.search(r'type="([^"]+)"', attrs) or [None, "text"])[1]
-        if kind == "select":
-            sel = re.findall(r"<option[^>]*selected[^>]*>(.*?)</option>", inner, re.S)
-            value = [clean(s) for s in sel] if sel else None
-        elif kind == "textarea":
-            value = html_to_text(inner)
-        elif typ in ("checkbox", "radio"):
-            if "checked" not in attrs:
-                continue
-            value = (re.search(r'value="([^"]*)"', attrs) or [None, True])[1]
-        elif typ in ("hidden", "submit", "button", "file"):
-            continue
-        else:
-            value = (re.search(r'value="([^"]*)"', attrs) or [None, ""])[1]
-        key = name.group(1)
-        if key in fields and typ == "checkbox":
-            fields[key] = (fields[key] if isinstance(fields[key], list) else [fields[key]]) + [value]
-        else:
-            fields[key] = value
-    return {"url": final, "fields": fields, "text": html_to_text(page_main(page))[:6000]}
+@server.tool("get_profile", "My candidate profile: every field of the profile form (position, primary keyword, "
+             "experience, salary, English and other languages, skills with years, location, formats, highlights, "
+             "about, looking for, mobilization deferment…) with current values and options, plus when the profile "
+             "can be raised in search again.", title="My profile")
+def get_profile() -> dict:
+    final, parsed, page = _profile_form()
+    i = page.find("можна знову оновити")
+    near = clean(page[max(0, i - 400):i + 300]) if i >= 0 else ""
+    m = re.search(r"Востаннє.*?дн\.|Last raised.*?days?", near)
+    raise_info = m.group(0) if m else None
+    fields = {k: v for k, v in parsed["fields"].items() if k != "csrfmiddlewaretoken"}
+    return {"url": final, "raise_info": raise_info, "fields": fields}
 
 
-@server.tool("inbox", "My Djinni inbox: conversations with recruiters (offers, replies to applications).",
-             {"page": {"type": "integer", "minimum": 1, "default": 1},
-              "filter": {"type": "string", "description": "optional query string from the inbox tabs, e.g. 'archive'"}})
-def inbox(page: int = 1, filter: str | None = None) -> dict:
-    qs = {k: v for k, v in (("page", page if page > 1 else None), ("filter", filter)) if v}
-    final, html_page = _account_page("/my/inbox/" + (f"?{urllib.parse.urlencode(qs)}" if qs else ""))
-    threads, seen = [], set()
-    for m in re.finditer(r'href="(/my/inbox/(\d+)/?)"', html_page):
-        if m.group(2) in seen:
-            continue
-        seen.add(m.group(2))
-        # the card around the link: up to the next thread link
-        start = m.start()
-        nxt = re.search(r'href="/my/inbox/\d+/?"', html_page[m.end():])
-        chunk = html_page[start:m.end() + (nxt.start() if nxt else 3000)]
-        threads.append({"id": m.group(2), "url": BASE + m.group(1), "preview": clean(chunk)[:400]})
-    out = {"url": final, "threads": threads}
-    if not threads:
-        out["text"] = html_to_text(page_main(html_page))[:8000]
+def _threads(page: str) -> list[dict]:
+    out = []
+    for m in re.finditer(r'<div\s+id="mt-(\d+)"\s+data-id="\d+"\s+class="proposal([^"]*)"(.*?)'
+                         r'(?=<div class="thread-item-wrapper|<div\s+id="mt-\d+"|\Z)', page, re.S):
+        body = m.group(3)
+        company = re.search(r'class="company_name[^"]*">(.*?)</div>', body, re.S)
+        names = [clean(s) for s in re.findall(r"<span>(.*?)</span>", company.group(1), re.S)] if company else []
+        names = [n for n in names if n and n != "·"]
+        title = re.search(r'<a class="to-job"[^>]*>(.*?)</a>', body, re.S)
+        last = re.search(r'class="message-text-inner[^"]*"[^>]*>(.*?)</a>', body, re.S)
+        date = re.search(r'class="small ms-1 js-date-value"[^>]*>(.*?)</span>\s*</div>', body, re.S)
+        read = re.search(r'title="((?:Прочитано|Read)[^"]*)"', body)
+        out.append({
+            "id": m.group(1), "url": f"{BASE}/my/inbox/{m.group(1)}/",
+            "company": names[0] if names else None, "recruiter": names[1] if len(names) > 1 else None,
+            "job": clean(title.group(1)) if title else None,
+            "last_message": clean(last.group(1)) if last else None,
+            "when": clean(date.group(1)) if date else None,
+            "read_by_them": read.group(1) if read else None,
+            "unread": "unread" in m.group(2),
+        })
     return out
 
 
-@server.tool("conversation", "One inbox conversation: the vacancy and every message, oldest first.",
-             {"thread_id": {"type": "string", "description": "id from `inbox`"}, **PAGING}, ["thread_id"])
-def conversation(thread_id: str, offset: int = 0, max_chars: int = 15000, links: bool = False) -> dict:
-    if not re.fullmatch(r"\d+", thread_id):
-        raise Stop("thread_id must be the numeric id from `inbox`")
-    final, page = _account_page(f"/my/inbox/{thread_id}/")
-    return _page_result(final, page, offset, max_chars, links)
+@server.tool("list_threads", "My Djinni inbox: offers from recruiters and my applications — company, recruiter, "
+             "vacancy, last message, when, whether they read it.",
+             {"bucket": {"type": "string", "enum": list(BUCKETS), "default": "all",
+                         "description": "all; unread; apply = my applications waiting for an answer; archive"},
+              "search": {"type": "string", "description": "inbox search text"},
+              "page": {"type": "integer", "minimum": 1, "default": 1}}, title="Inbox")
+def list_threads(bucket: str = "all", search: str | None = None, page: int = 1) -> dict:
+    qs = {k: v for k, v in (("bucket", None if bucket == "all" else bucket), ("q", search),
+                            ("page", page if page > 1 else None)) if v}
+    final, html_page = _get("/my/inbox/" + (f"?{urllib.parse.urlencode(qs)}" if qs else ""))
+    threads = _threads(html_page)
+    return {"url": final, "bucket": bucket, "count": len(threads),
+            "has_next": f"page={page + 1}" in html_page, "threads": threads}
 
 
-# ---------------------------------------------------------- public jobs ---
+def _messages(page: str) -> list[dict]:
+    msgs = []
+    for m in re.finditer(r'<div\s+id="msg_(\d+)"\s+class="thread-message[^"]*"[^>]*>(.*?)'
+                         r'(?=<div\s+id="msg_\d+"\s+class="thread-message|<form\b|\Z)', page, re.S):
+        body = m.group(2)
+        author = re.search(r'class="font-weight-500 ms-2">(.*?)</div>', body, re.S)
+        when = re.search(r'<small\s+class="text-secondary"[^>]*?title="([^"]+)"', body)
+        alerts = [clean(a) for a in re.findall(r'class="msg-alert[^"]*">(.*?)</div>', body, re.S)]
+        text = re.search(r'class="thread-message-body[^"]*">\s*<div>(.*?)</div>', body, re.S) or \
+            re.search(r'class="thread-message-body[^"]*">(.*?)</div>', body, re.S)
+        msgs.append({"id": m.group(1), "author": clean(author.group(1)) if author else None,
+                     "time": when.group(1) if when else None, "notes": [a for a in alerts if a] or None,
+                     "text": html_to_text(text.group(1)) if text else None})
+    return msgs
+
+
+@server.tool("get_thread", "One inbox thread: the vacancy card (company, recruiter, conditions, CV shared, salary "
+             "notes) and every message (id, author, time, text, notes like 'Ви відгукнулись').",
+             {"thread": {"type": "string", "description": "id from list_threads"},
+              "last": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50}}, ["thread"],
+             title="Inbox thread")
+def get_thread(thread: str, last: int = 50) -> dict:
+    tid = _thread_id(thread)
+    final, page = _get(f"/my/inbox/{tid}/")
+    msgs = _messages(page)
+    return {"url": final, "thread": tid, "vacancy_card": _sidebar(page), "count": len(msgs),
+            "messages": msgs[-last:], "can_reply": "js-inbox-reply-form" in page}
+
+
+@server.tool("get_stats", "My Djinni stats: contacts with companies in 3 months vs similar hired candidates, "
+             "offers received, applications sent and read, how often recruiters read profiles like mine.",
+             title="My stats")
+def get_stats() -> dict:
+    final, page = _get("/my/stats/")
+    return {"url": final, "text": _text(page)[:8000]}
+
 
 def _obj(value, key: str = "name") -> dict:
     if isinstance(value, dict):
@@ -244,8 +313,48 @@ def _postings(page: str) -> list[dict]:
     return out
 
 
-@server.tool("search_jobs", "Public Djinni job search (no login needed). ~15 vacancies per page with a short "
-             "description; use get_job for the full text.",
+def _cards(page: str) -> list[dict]:
+    """Job cards without structured data (the dashboard): link, title, the card's text."""
+    out, seen = [], set()
+    for m in re.finditer(r'href="(/jobs/(\d+)-[^"/?#]+/)[^"]*"[^>]*>(.*?)</a>', page, re.S):
+        if m.group(2) in seen or not clean(m.group(3)):
+            continue
+        seen.add(m.group(2))
+        tail = re.sub(r"<script.*?</script>", "", page[m.end():m.end() + 2500], flags=re.S)
+        out.append({"id": m.group(2), "url": BASE + m.group(1), "title": clean(m.group(3)),
+                    "details": clean(tail)[:400]})
+    return out
+
+
+@server.tool("get_recommended_jobs", "Vacancies Djinni recommends for my profile (the 'Вакансії' dashboard).",
+             {"description_chars": {"type": "integer", "minimum": 0, "maximum": 5000, "default": 400}},
+             title="Recommended jobs")
+def get_recommended_jobs(description_chars: int = 400) -> dict:
+    final, page = _get("/my/dashboard/")
+    jobs = _postings(page)
+    for j in jobs:
+        j["description"] = j["description"][:description_chars]
+    jobs = jobs or _cards(page)
+    return {"url": final, "count": len(jobs), "jobs": jobs}
+
+
+@server.tool("get_page", "Read any djinni.co page in my session as text, e.g. /my/hires/, /my/subscriptions/, "
+             "/my/stoplist/, /my/account/, /salaries/. Action links (logout, stop, kill, ?action=…) are refused.",
+             {"path": {"type": "string", "description": "a djinni.co path or full https URL"},
+              "links": {"type": "boolean", "default": False, "description": "also return the page's djinni.co links"},
+              **PAGING}, ["path"], title="Read a Djinni page")
+def get_page(path: str, links: bool = False, offset: int = 0, max_chars: int = 15000) -> dict:
+    final, page = _get(path)
+    out = {"url": final, "title": page_title(page), **_slice(_text(page), offset, max_chars)}
+    if links:
+        out["links"] = page_links(page_main(page), final, HOSTS)
+    return out
+
+
+# ------------------------------------------------------------------- jobs ---
+
+@server.tool("search_jobs", "Djinni job search: ~15 vacancies per page with a short description; use get_job "
+             "for the full text.",
              {"keywords": {"type": "array", "items": {"type": "string"},
                            "description": "Djinni categories (primary_keyword): JavaScript, Node.js, Fullstack…"},
               "search": {"type": "string", "description": "free text (all_keywords)"},
@@ -254,11 +363,13 @@ def _postings(page: str) -> list[dict]:
               "remote": {"type": "boolean", "default": False},
               "english": {"type": "string", "enum": list(ENGLISH)},
               "region": {"type": "array", "items": {"type": "string", "enum": list(REGIONS)}},
+              "salary_from": {"type": "integer", "minimum": 0, "description": "USD per month"},
               "page": {"type": "integer", "minimum": 1, "default": 1},
-              "description_chars": {"type": "integer", "minimum": 0, "maximum": 5000, "default": 600}})
+              "description_chars": {"type": "integer", "minimum": 0, "maximum": 5000, "default": 600}},
+             title="Search vacancies")
 def search_jobs(keywords: list[str] | None = None, search: str | None = None, experience: list[int] | None = None,
                 remote: bool = False, english: str | None = None, region: list[str] | None = None,
-                page: int = 1, description_chars: int = 600) -> dict:
+                salary_from: int | None = None, page: int = 1, description_chars: int = 600) -> dict:
     params = [("primary_keyword", k) for k in keywords or []]
     params += [("exp_level", "no_exp" if y == 0 else f"{y}y") for y in experience or []]
     if search:
@@ -267,6 +378,8 @@ def search_jobs(keywords: list[str] | None = None, search: str | None = None, ex
         params.append(("employment", "remote"))
     if english:
         params.append(("english_level", english))
+    if salary_from:
+        params.append(("salary", salary_from))
     params += [("region", r) for r in region or []]
     if page > 1:
         params.append(("page", page))
@@ -281,22 +394,152 @@ def search_jobs(keywords: list[str] | None = None, search: str | None = None, ex
     return {"url": url, "page": page, "count": len(jobs), "has_next": f"page={page + 1}" in html_page, "jobs": jobs}
 
 
-@server.tool("get_job", "Full text of one public Djinni vacancy.",
-             {"url": {"type": "string", "description": "the vacancy URL, https://djinni.co/jobs/<id>-<slug>/ "
-                                                       "(as returned by search_jobs)"}}, ["url"], title="Vacancy")
+def _apply_form(page: str) -> str | None:
+    form = re.search(r'<form\b[^>]*id="apply_form"[^>]*>(.*?)</form>', page, re.S)
+    return form.group(1) if form else None
+
+
+@server.tool("get_job", "Full text of one Djinni vacancy, plus whether I can still apply (or the thread if I "
+             "already did), the CVs I can attach and my profile salary.",
+             {"url": {"type": "string", "description": "https://djinni.co/jobs/<id>-<slug>/ (as search_jobs returns)"}},
+             ["url"], title="Vacancy")
 def get_job(url: str) -> dict:
-    m = re.match(r"https://djinni\.co/jobs/(\d+)-[^/?#]+/?", url.strip())
-    if not m:
-        raise Stop("give the full vacancy URL https://djinni.co/jobs/<id>-<slug>/ (a bare id gives 404 on Djinni)")
-    final, status, html_page = session.request(url.strip())
-    if status >= 400:
-        raise Stop(f"HTTP {status} on {url} — vacancy closed or the URL is wrong")
-    jobs = _postings(html_page)
-    out = jobs[0] if jobs else {"id": m.group(1)}
-    out["url"] = final
-    if not jobs:
-        out["text"] = html_to_text(page_main(html_page))[:20000]
+    final, page = _get(_job_url(url))
+    jobs = _postings(page)
+    out = jobs[0] if jobs else {"text": _text(page)[:20000]}
+    form = _apply_form(page)
+    cvs = re.findall(r'<option value="(\d+)"[^>]*data-cv-name="([^"]*)"[^>]*data-cv-date="([^"]*)"', form or "")
+    salary = re.search(r'name="salary_changed"[^>]*data-value="(\d+)"', form or "")
+    thread = re.search(r'href="/my/inbox/(\d+)/', page)
+    out.update({"url": final, "can_apply": bool(form),
+                "thread": thread.group(1) if thread and not form else None,
+                "cvs": [{"id": i, "file": n, "date": d} for i, n, d in cvs] or None,
+                "profile_salary": int(salary.group(1)) if salary else None})
     return out
+
+
+# ------------------------------------------------------------ write tools ---
+
+@server.tool("update_profile", "Change fields of my Djinni profile (names from get_profile; lists for multi-choice "
+             "fields, true/false for single checkboxes). Every other field keeps its current value.",
+             {"changes": {"type": "object", "description": 'e.g. {"position": "Full Stack Engineer", "salary_min": "2500"}'},
+              **DRY_RUN}, ["changes"], title="Edit my profile", read_only=False, destructive=True, idempotent=True)
+def update_profile(changes: dict, dry_run: bool = False) -> dict:
+    if not changes:
+        raise Stop("nothing to change")
+    final, parsed, page = _profile_form()
+    pairs = override_form(parsed["pairs"], parsed["fields"], changes)
+    before = {k: parsed["fields"][k].get("value") for k in changes}
+    if dry_run:
+        return {"dry_run": True, "url": final, "before": before, "after": changes}
+    if not any(n == "csrfmiddlewaretoken" for n, _ in pairs):
+        pairs.append(("csrfmiddlewaretoken", _csrf(page)))
+    _, status, body = session.request(f"{BASE}/my/profile/", data=pairs,
+                                      headers={"Referer": f"{BASE}/my/profile/", "Origin": BASE})
+    if status >= 400:
+        raise Stop(f"HTTP {status} saving the profile")
+    errors = [clean(e) for e in re.findall(r'class="[^"]*(?:invalid-feedback d-block|errorlist)[^"]*"[^>]*>(.*?)</',
+                                           body, re.S) if clean(e)]
+    _, after, _ = _profile_form()
+    now = {k: after["fields"].get(k, {}).get("value") for k in changes}
+    return {"saved": not errors, "errors": errors or None, "before": before, "now": now}
+
+
+def _message_ids(page: str) -> list[str]:
+    return re.findall(r'<div\s+id="msg_(\d+)"\s+class="thread-message', page)
+
+
+@server.tool("send_message", "Reply in an inbox thread (to a recruiter's offer or after my application).",
+             {"thread": {"type": "string", "description": "id from list_threads"},
+              "text": {"type": "string"}, **DRY_RUN}, ["thread", "text"], title="Send a message",
+             read_only=False, destructive=False, idempotent=False)
+def send_message(thread: str, text: str, dry_run: bool = False) -> dict:
+    tid = _thread_id(thread)
+    if not text.strip():
+        raise Stop("empty message")
+    final, page = _get(f"/my/inbox/{tid}/")
+    if "js-inbox-reply-form" not in page:
+        raise Stop("this thread has no reply form (closed or archived)")
+    payload = {"thread": tid, "url": final, "text": text, "context": (_sidebar(page) or "")[:300] or None}
+    if dry_run:
+        return {"dry_run": True, "would_send": payload}
+    before = _message_ids(page)
+    token = _csrf(page)
+    _, status, _ = session.request(final, data=[("csrfmiddlewaretoken", token), ("message", text)],
+                                   headers={"Referer": final, "Origin": BASE, "X-CSRFToken": token,
+                                            "HX-Request": "true"})
+    if status >= 400:
+        raise Stop(f"HTTP {status} sending the message")
+    _, page = _get(f"/my/inbox/{tid}/")
+    new = [i for i in _message_ids(page) if i not in before]
+    return {"sent": bool(new), "message_id": new[-1] if new else None,
+            "note": None if new else "no new message in the thread — check get_thread before retrying"}
+
+
+@server.tool("apply_to_job", "Apply to a Djinni vacancy as me: a message (cover letter), which of my uploaded CVs "
+             "to attach (default: the one Djinni preselects; '' = none) and optionally a salary expectation for "
+             "this vacancy only. Refuses if I already applied.",
+             {"url": {"type": "string", "description": "https://djinni.co/jobs/<id>-<slug>/"},
+              "message": {"type": "string"},
+              "cv_id": {"type": "string", "description": "id from get_job.cvs; '' to send no CV"},
+              "salary": {"type": "integer", "minimum": 0, "description": "USD/month for this vacancy only"},
+              **DRY_RUN}, ["url", "message"], title="Apply to a vacancy", read_only=False,
+             destructive=False, idempotent=False)
+def apply_to_job(url: str, message: str, cv_id: str | None = None, salary: int | None = None,
+                 dry_run: bool = False) -> dict:
+    final, page = _get(_job_url(url))
+    form = _apply_form(page)
+    if not form:
+        thread = re.search(r'href="/my/inbox/(\d+)/', page)
+        raise Stop("no apply form on this vacancy" + (f" — already applied (thread {thread.group(1)})" if thread else
+                                                      " (closed, or applying happens elsewhere)"))
+    if not message.strip():
+        raise Stop("empty message")
+    parsed = parse_form(form)
+    changes: dict = {"message": message}
+    if cv_id is not None:
+        changes["cv_file_upload_id"] = cv_id
+    if salary is not None:
+        changes["salary_changed"] = str(salary)
+    pairs = override_form(parsed["pairs"], parsed["fields"], changes)
+    pairs = [(n, v) for n, v in pairs if n not in ("save_msg_template", "msg_template_name")]
+    cv_sent = dict(pairs).get("cv_file_upload_id")
+    cv_name = next((o["label"] for o in parsed["fields"].get("cv_file_upload_id", {}).get("options", [])
+                    if o["value"] == cv_sent), None)
+    profile_salary = re.search(r'name="salary_changed"[^>]*data-value="(\d+)"', form)
+    job = (_postings(page) or [{}])[0]
+    payload = {"vacancy": job.get("title"), "company": job.get("company"), "url": final, "message": message,
+               "cv": cv_name if cv_sent else None, "salary_for_this_vacancy": salary,
+               "profile_salary": int(profile_salary.group(1)) if profile_salary else None}
+    if dry_run:
+        return {"dry_run": True, "would_send": payload}
+    pairs.append(("job_apply", ""))
+    _, status, _ = session.request(final, data=pairs, headers={"Referer": final, "Origin": BASE})
+    if status >= 400:
+        raise Stop(f"HTTP {status} sending the application")
+    _, page = _get(final)
+    applied = _apply_form(page) is None
+    return {"applied": applied, **payload,
+            "note": None if applied else "the vacancy still shows the apply form — check list_threads(bucket='apply')"}
+
+
+@server.tool("decline_offer", "Decline a recruiter's offer: Djinni archives the thread and tells the recruiter "
+             "I'm not interested.",
+             {"thread": {"type": "string", "description": "id from list_threads"}, **DRY_RUN}, ["thread"],
+             title="Decline an offer", read_only=False, destructive=True, idempotent=True)
+def decline_offer(thread: str, dry_run: bool = False) -> dict:
+    tid = _thread_id(thread)
+    final, page = _get(f"/my/inbox/{tid}/")
+    payload = {"thread": tid, "url": final, "context": (_sidebar(page) or "")[:300] or None}
+    if dry_run:
+        return {"dry_run": True, "would_decline": payload}
+    _, status, _ = session.request(f"{BASE}/htmx/htmx_archive/", data={"mt_id": tid},
+                                   headers={"Referer": f"{BASE}/my/inbox/", "Origin": BASE,
+                                            "X-CSRFToken": _csrf(page), "HX-Request": "true"})
+    if status >= 400:
+        raise Stop(f"HTTP {status} declining")
+    _, arch = _get("/my/inbox/?bucket=archive")
+    return {"declined": f'"mt-{tid}"' in arch, **payload}
 
 
 # ------------------------------------------------------------------ main ---

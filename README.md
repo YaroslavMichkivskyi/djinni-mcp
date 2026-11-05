@@ -4,12 +4,14 @@
 > rough edges and breaking changes. Not affiliated with Djinni.
 
 An MCP server that lets an AI assistant (Claude Code, Codex, any MCP client)
-read **your own** [Djinni](https://djinni.co) candidate account — profile,
-inbox, conversations with recruiters — and search public vacancies.
+work with **your own** [Djinni](https://djinni.co) candidate account — profile,
+inbox threads with recruiters, stats, recommended jobs — and search vacancies.
 
 - Python 3 standard library only — no dependencies, Windows / macOS / Linux.
-- Read-only for now; write tools (reply, apply, edit profile) will come with
-  `dry_run` and `readOnlyHint: false` annotations so the client asks first.
+- 10 read tools, 4 write tools (`update_profile`, `send_message`,
+  `apply_to_job`, `decline_offer`). Every write tool has `dry_run` and is
+  annotated `readOnlyHint: false`, so the client can ask before each call.
+- Links that change the account (`/my/stop/`, `/my/kill9/`, `?action=…`) are never opened.
 - Paced requests (3–7 s), daily cap, stops on rate limits / captchas.
 
 ## Run
@@ -31,6 +33,9 @@ Claude Code (`.mcp.json`):
 { "mcpServers": { "djinni": { "type": "stdio", "command": "python", "args": ["path/to/djinni-mcp/server.py"] } } }
 ```
 
-Tool list and permission setup: [AGENTS.md](AGENTS.md).
+Optional: `DJINNI_MCP_READ_ONLY=1` hides the write tools.
+
+Allow the read tools and keep the write tools on "ask" — see the permissions
+example and the full tool list in [AGENTS.md](AGENTS.md).
 
 Use it only with your own account and at a human pace.
