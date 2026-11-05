@@ -34,6 +34,7 @@ Read — annotated `readOnlyHint: true`:
 | `search_jobs` | categories, experience years, remote, English, region, salary from, text; ~15 / page | 1 |
 | `get_job` | full vacancy + `can_apply` / existing `thread`, my CVs, profile salary | 1 |
 | `get_page` | any djinni.co page as text (+ links); action links refused | 1 |
+| `list_apply_templates` | my saved apply-message templates (read from an apply form) | 1–6 |
 
 Write — `readOnlyHint: false`, each with `dry_run` (returns the exact payload, sends nothing):
 
@@ -43,6 +44,7 @@ Write — `readOnlyHint: false`, each with `dry_run` (returns the exact payload,
 | `send_message` | reply in a thread; verifies the new message appeared | not idempotent |
 | `apply_to_job` | apply with a message, chosen CV, optional salary for this vacancy; refuses a repeat | not idempotent |
 | `decline_offer` | decline + archive a recruiter's offer | destructive, idempotent |
+| `delete_apply_template` | delete a saved apply-message template | destructive, idempotent |
 
 Not exposed on purpose: raising the profile (Djinni allows it once per
 cooldown and gives no stable endpoint while it is locked), switching the search
@@ -68,9 +70,10 @@ Per-tool permissions in Claude Code (`.claude/settings.json` or `settings.local.
     "allow": ["mcp__djinni__status", "mcp__djinni__login", "mcp__djinni__get_profile",
               "mcp__djinni__list_threads", "mcp__djinni__get_thread", "mcp__djinni__get_stats",
               "mcp__djinni__get_recommended_jobs", "mcp__djinni__search_jobs", "mcp__djinni__get_job",
-              "mcp__djinni__get_page"],
+              "mcp__djinni__get_page", "mcp__djinni__list_apply_templates"],
     "ask":   ["mcp__djinni__update_profile", "mcp__djinni__send_message",
-              "mcp__djinni__apply_to_job", "mcp__djinni__decline_offer"] } }
+              "mcp__djinni__apply_to_job", "mcp__djinni__decline_offer",
+              "mcp__djinni__delete_apply_template"] } }
 ```
 
 `deny` instead of `ask` blocks a tool; other clients get the same split from

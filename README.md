@@ -8,8 +8,8 @@ work with **your own** [Djinni](https://djinni.co) candidate account — profile
 inbox threads with recruiters, stats, recommended jobs — and search vacancies.
 
 - Python 3 standard library only — no dependencies, Windows / macOS / Linux.
-- 10 read tools, 4 write tools (`update_profile`, `send_message`,
-  `apply_to_job`, `decline_offer`). Every write tool has `dry_run` and is
+- 11 read tools, 5 write tools (`update_profile` incl. skills, `send_message`,
+  `apply_to_job`, `decline_offer`, `delete_apply_template`). Every write tool has `dry_run` and is
   annotated `readOnlyHint: false`, so the client can ask before each call.
 - Links that change the account (`/my/stop/`, `/my/kill9/`, `?action=…`) are never opened.
 - Paced requests (3–7 s), daily cap, stops on rate limits / captchas.

@@ -28,7 +28,7 @@ from mcpkit import (DRY_RUN_PROP, PAGING_PROPS, McpServer, SiteSession, Stop, at
                     csrf_token, html_to_text, is_action_link, load_env, log, override_form, page_links, page_main,
                     page_title, parse_form, slice_text)
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 BASE = "https://djinni.co"
 HOSTS = ("djinni.co",)
 # Plain GET links that change the account: /my/kill9/ deletes it, /my/stop/ switches the search off,
@@ -583,6 +583,59 @@ def apply_to_job(url: str, message: str, cv_id: str | None = None, salary: int |
     applied = _apply_form(page) is None
     return {"applied": applied, **payload,
             "note": None if applied else "the vacancy still shows the apply form — check list_threads(bucket='apply')"}
+
+
+def _templates_page(url: str | None) -> tuple[str, str]:
+    """A vacancy page with the apply form — the only place Djinni shows my saved message templates."""
+    if url:
+        final, page = _get(_job_url(url))
+        if _apply_form(page):
+            return final, page
+    _, dash = _get("/my/dashboard/")
+    for job in (_postings(dash) or _cards(dash))[:5]:
+        final, page = _get(job["url"])
+        if _apply_form(page):
+            return final, page
+    raise Stop("found no open vacancy with an apply form to read the templates from — pass `url`")
+
+
+def _templates(page: str) -> list[dict]:
+    out = []
+    for tid, body in re.findall(r'<tr\b[^>]*\bid="tr_(\d+)"[^>]*>(.*?)</tr>', page, re.S):
+        put = re.search(r'<td\b[^>]*class="js-template-put"[^>]*>', body)
+        name = re.search(r'class="toggle-help"[^>]*>(.*?)</a>', body, re.S)
+        out.append({"id": tid, "name": clean(name.group(1)) if name else None,
+                    "text": attr(put.group(0), "value") if put else None})
+    return out
+
+
+@server.tool("list_apply_templates", "My saved apply-message templates (Djinni offers them in every apply form).",
+             {"url": {"type": "string", "description": "optional vacancy URL to read them from; default: a "
+                                                       "vacancy from my dashboard"}}, title="Apply templates")
+def list_apply_templates(url: str | None = None) -> dict:
+    final, page = _templates_page(url)
+    templates = _templates(page)
+    return {"read_from": final, "count": len(templates), "templates": templates}
+
+
+@server.tool("delete_apply_template", "Delete one of my saved apply-message templates.",
+             {"template_id": {"type": "string", "description": "id from list_apply_templates"}, **DRY_RUN},
+             ["template_id"], title="Delete an apply template", read_only=False, destructive=True, idempotent=True)
+def delete_apply_template(template_id: str, dry_run: bool = False) -> dict:
+    if not re.fullmatch(r"\d+", str(template_id)):
+        raise Stop("template_id must be the numeric id from list_apply_templates")
+    final, page = _templates_page(None)
+    hit = next((t for t in _templates(page) if t["id"] == str(template_id)), None)
+    if not hit:
+        raise Stop(f"template {template_id} not found; templates: {[(t['id'], t['name']) for t in _templates(page)]}")
+    if dry_run:
+        return {"dry_run": True, "would_delete": hit}
+    # the site's own trash button: a plain GET answered with "ok"
+    _, status, body = session.request(f"{BASE}/ajax/remove_template/{template_id}",
+                                      headers={"Referer": final, "X-Requested-With": "XMLHttpRequest"})
+    if status >= 400 or body.strip() != "ok":
+        raise Stop(f"Djinni did not confirm the deletion (HTTP {status}: {body.strip()[:80]})")
+    return {"deleted": hit}
 
 
 @server.tool("decline_offer", "Decline a recruiter's offer: Djinni archives the thread and tells the recruiter "
