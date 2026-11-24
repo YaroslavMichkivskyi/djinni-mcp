@@ -17,6 +17,7 @@ For people: `README.md`.
 | `server.py` | the tools below, Djinni login and parsing |
 | `mcpkit.py` | shared kit: MCP stdio + tool annotations + read-only switches, paced cookie session, forms, `.env` loader, HTML → text. Identical copy in `dou-mcp` — change one, copy to the other |
 | `.state/` | cookies + request ledger (gitignored; `--state-dir` / `DJINNI_MCP_STATE_DIR`) |
+| `NOTES.md` | non-obvious Djinni behaviour, read it before debugging a tool: date semantics (JSON-LD `datePosted` is the *update* date, the real published/updated pair is on the job page), atomic profile saves, skill-year format and name normalisation, field limits and codes, session quirks, profile field map |
 
 ## Tools
 
