@@ -42,7 +42,7 @@ Write — `readOnlyHint: false`, each with `dry_run` (returns the exact payload,
 |---|---|---|
 | `update_profile` | change profile fields by name (others keep their values; options validated); `add_skills` / `remove_skills` for skill chips — Djinni renames new skills to its own dictionary entries, so check `get_profile` after | destructive, idempotent |
 | `send_message` | reply in a thread; verifies the new message appeared | not idempotent |
-| `apply_to_job` | apply with a message, chosen CV, optional salary for this vacancy; refuses a repeat | not idempotent |
+| `apply_to_job` | apply with a message, a chosen uploaded CV or a local PDF (`cv_path`, ≤ 10 MB, optionally `save_cv_to_profile`), optional salary for this vacancy; refuses a repeat | not idempotent |
 | `decline_offer` | decline + archive a recruiter's offer | destructive, idempotent |
 | `delete_apply_template` | delete a saved apply-message template | destructive, idempotent |
 

@@ -539,17 +539,40 @@ def send_message(thread: str, text: str, dry_run: bool = False) -> dict:
             "note": None if new else "no new message in the thread — check get_thread before retrying"}
 
 
-@server.tool("apply_to_job", "Apply to a Djinni vacancy as me: a message (cover letter), which of my uploaded CVs "
-             "to attach (default: the one Djinni preselects; '' = none) and optionally a salary expectation for "
-             "this vacancy only. Refuses if I already applied.",
+CV_MAX_BYTES = 10_000_000  # Djinni: "тільки резюме в форматі PDF і розміром до 10MB"
+
+
+def _cv_file(cv_path: str) -> Path:
+    path = Path(cv_path).expanduser()
+    if not path.is_file():
+        raise Stop(f"cv_path: no such file {path}")
+    if path.suffix.lower() != ".pdf" or not path.read_bytes()[:5] == b"%PDF-":
+        raise Stop("cv_path: Djinni accepts only PDF files")
+    if path.stat().st_size > CV_MAX_BYTES:
+        raise Stop(f"cv_path: {path.stat().st_size} bytes — Djinni's limit is 10 MB")
+    return path
+
+
+@server.tool("apply_to_job", "Apply to a Djinni vacancy as me: a message (cover letter), the CV — one of my "
+             "uploaded CVs (default: the one Djinni preselects; '' = none) or a local PDF uploaded with this "
+             "application — and optionally a salary expectation for this vacancy only. Refuses if I already applied.",
              {"url": {"type": "string", "description": "https://djinni.co/jobs/<id>-<slug>/"},
               "message": {"type": "string"},
               "cv_id": {"type": "string", "description": "id from get_job.cvs; '' to send no CV"},
+              "cv_path": {"type": "string", "description": "local PDF (≤ 10 MB) to upload with this application "
+                                                           "instead of an uploaded CV; not combinable with cv_id"},
+              "save_cv_to_profile": {"type": "boolean", "default": False,
+                                     "description": "with cv_path: also keep the PDF among my profile CVs"},
               "salary": {"type": "integer", "minimum": 0, "description": "USD/month for this vacancy only"},
               **DRY_RUN}, ["url", "message"], title="Apply to a vacancy", read_only=False,
              destructive=False, idempotent=False)
 def apply_to_job(url: str, message: str, cv_id: str | None = None, salary: int | None = None,
-                 dry_run: bool = False) -> dict:
+                 cv_path: str | None = None, save_cv_to_profile: bool = False, dry_run: bool = False) -> dict:
+    if cv_path and cv_id is not None:
+        raise Stop("pass either cv_id or cv_path, not both")
+    if save_cv_to_profile and not cv_path:
+        raise Stop("save_cv_to_profile needs cv_path")
+    cv_file = _cv_file(cv_path) if cv_path else None
     final, page = _get(_job_url(url))
     form = _apply_form(page)
     if not form:
@@ -566,17 +589,26 @@ def apply_to_job(url: str, message: str, cv_id: str | None = None, salary: int |
         changes["salary_changed"] = str(salary)
     pairs = override_form(parsed["pairs"], parsed["fields"], changes)
     pairs = [(n, v) for n, v in pairs if n not in ("save_msg_template", "msg_template_name")]
-    cv_sent = dict(pairs).get("cv_file_upload_id")
-    cv_name = next((o["label"] for o in parsed["fields"].get("cv_file_upload_id", {}).get("options", [])
-                    if o["value"] == cv_sent), None)
+    if cv_file:
+        # what the form's "+ Додати резюме" swaps in: a cv_file input instead of the cv_file_upload_id select
+        pairs = [(n, v) for n, v in pairs if n != "cv_file_upload_id"]
+        if save_cv_to_profile:
+            pairs.append(("save_profile_cv", "on"))
+        cv_name = f"{cv_file.name} (uploaded now from {cv_file}, {cv_file.stat().st_size} bytes" + \
+                  (", also saved to the profile)" if save_cv_to_profile else ")")
+    else:
+        cv_sent = dict(pairs).get("cv_file_upload_id")
+        cv_name = next((o["label"] for o in parsed["fields"].get("cv_file_upload_id", {}).get("options", [])
+                        if o["value"] == cv_sent), None) if cv_sent else None
     job = (_postings(page) or [{}])[0]
     payload = {"vacancy": job.get("title"), "company": job.get("company"), "url": final, "message": message,
-               "cv": cv_name if cv_sent else None, "salary_for_this_vacancy": dict(pairs).get("salary_changed") or None,
+               "cv": cv_name, "salary_for_this_vacancy": dict(pairs).get("salary_changed") or None,
                "profile_salary": _profile_salary(form)}
     if dry_run:
         return {"dry_run": True, "would_send": payload}
     pairs.append(("job_apply", ""))
-    _, status, _ = session.request(final, data=pairs, headers={"Referer": final, "Origin": BASE})
+    _, status, _ = session.request(final, data=pairs, headers={"Referer": final, "Origin": BASE},
+                                   files=[("cv_file", cv_file)] if cv_file else None)
     if status >= 400:
         raise Stop(f"HTTP {status} sending the application")
     _, page = _get(final)
