@@ -15,6 +15,8 @@ Switches: DJINNI_MCP_READ_ONLY=1, DJINNI_MCP_DISABLED_TOOLS=a,b, DJINNI_MCP_DAIL
 from __future__ import annotations
 
 import argparse
+import datetime
+import html
 import json
 import os
 import re
@@ -296,6 +298,43 @@ def _postings(page: str) -> list[dict]:
             })
     return out
 
+_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+    "січня": 1, "лютого": 2, "березня": 3, "квітня": 4, "травня": 5, "червня": 6,
+    "липня": 7, "серпня": 8, "вересня": 9, "жовтня": 10, "листопада": 11, "грудня": 12,
+}
+
+
+def _iso_day(day: str, month_word: str, today: datetime.date) -> str | None:
+    """'16 September' -> '2026-09-16'; the year is inferred (never in the future)."""
+    month = _MONTHS.get(month_word.lower())
+    if not month:
+        return None
+    try:
+        value = datetime.date(today.year, month, int(day))
+    except ValueError:
+        return None
+    if value > today:
+        value = datetime.date(today.year - 1, month, int(day))
+    return value.isoformat()
+
+
+def _publication(page: str) -> tuple[str | None, str | None]:
+    """(published, updated) from the public job page: 'Published 16 September · Updated 23 November'.
+
+    JSON-LD `datePosted` is the *update* date, not the publication date, so it cannot be used for this.
+    """
+    block = re.search(r'<div\s+id="job-publication-info"[^>]*>(.*?)</div>\s*<div\s+class="fs-5"', page, re.S)
+    if not block:
+        return None, None
+    text = html.unescape(re.sub(r"<[^>]+>", " ", block.group(1)))
+    today = datetime.date.today()
+    published = re.search(r"(?:Published|Опубліковано)\s+(\d{1,2})\s+([^\s·,]+)", text)
+    updated = re.search(r"(?:Updated|Оновлено)\s+(\d{1,2})\s+([^\s·,]+)", text)
+    return (_iso_day(*published.groups(), today) if published else None,
+            _iso_day(*updated.groups(), today) if updated else None)
+
 
 def _cards(page: str) -> list[dict]:
     """Job cards without structured data (the dashboard): link, title, the card's text."""
@@ -393,9 +432,12 @@ def get_job(url: str) -> dict:
     out = jobs[0] if jobs else {"text": _text(page)[:20000]}
     form = _apply_form(page)
     thread = re.search(r'href="/my/inbox/(\d+)/', page)
+    published, updated = _publication(page)
     out.update({"url": final, "can_apply": bool(form),
                 "thread": thread.group(1) if thread and not form else None,
-                "cvs": _cvs(form) if form else None, "profile_salary": _profile_salary(form) if form else None})
+                "cvs": _cvs(form) if form else None, "profile_salary": _profile_salary(form) if form else None,
+                "published_at": published, "updated_at": updated,
+                "bumped": bool(published and updated and updated > published)})
     return out
 
 
